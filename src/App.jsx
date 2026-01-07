@@ -180,7 +180,7 @@ const parsePostmanCollection = (json) => {
                  'application/json': {
                    schema: {
                      properties,
-                     required: [] // Postman doesn't specify required fields in body usually
+                     required: Object.keys(parsedBody) // All keys in the raw body example are now marked as required
                    }
                  }
                }
