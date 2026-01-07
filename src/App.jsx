@@ -93,6 +93,127 @@ const extractFieldsFromSchema = (schema, definitions) => {
   }));
 };
 
+// --- NEW: Postman Parsing Logic ---
+
+const parsePostmanCollection = (json) => {
+  const endpoints = [];
+
+  // Recursive function to handle nested folders
+  const traverseItems = (items) => {
+    items.forEach(item => {
+      if (item.item) {
+        // It's a folder
+        traverseItems(item.item);
+      } else if (item.request) {
+        // It's a request
+        const req = item.request;
+        const method = req.method?.toLowerCase() || 'get';
+        
+        // 1. Extract Path & Params
+        let pathStr = '';
+        let pathParams = [];
+        let queryParams = [];
+
+        if (req.url) {
+          // Handle Object URL (standard in v2.1)
+          if (typeof req.url === 'object') {
+            // Path: Join parts and ensure leading slash
+            if (req.url.path) {
+              const p = Array.isArray(req.url.path) ? req.url.path.join('/') : req.url.path;
+              pathStr = p.startsWith('/') ? p : '/' + p;
+            }
+            
+            // Path Variables: Stored in 'variable' array in Postman
+            if (req.url.variable) {
+              pathParams = req.url.variable.map(v => ({
+                name: v.key,
+                in: 'path',
+                required: true,
+                description: v.description
+              }));
+            }
+
+            // Query Params
+            if (req.url.query) {
+              queryParams = req.url.query.map(q => ({
+                name: q.key,
+                in: 'query',
+                required: false,
+                description: q.description
+              }));
+            }
+          } else if (typeof req.url === 'string') {
+            // Handle String URL (older format or simplifed)
+            try {
+              // Try to extract path from full URL string
+              // Remove {{variables}} to parse correctly
+              const cleanUrl = req.url.replace(/{{/g, '').replace(/}}/g, '');
+              const urlObj = new URL(cleanUrl.startsWith('http') ? cleanUrl : 'http://placeholder.com/' + cleanUrl);
+              pathStr = urlObj.pathname;
+            } catch (e) {
+              pathStr = req.url;
+            }
+          }
+        }
+
+        // Convert Postman :id syntax to Swagger {id} syntax for compatibility
+        pathStr = pathStr.replace(/:([a-zA-Z0-9_]+)/g, '{$1}');
+
+        // 2. Extract Body Fields (Attempt to parse raw JSON body to find keys)
+        let requestBody = null;
+        if (['post', 'put', 'patch'].includes(method) && req.body?.mode === 'raw' && req.body?.raw) {
+           try {
+             // Basic attempt to parse JSON body to generate fields
+             // We strip comments or loose json slightly if needed, but strict parse first
+             // Also replace {{vars}} with placeholders to allow parsing
+             const safeJson = req.body.raw.replace(/{{.*?}}/g, '"VAR"');
+             const parsedBody = JSON.parse(safeJson);
+             
+             // Construct a fake schema so our existing UI renderer works
+             const properties = {};
+             Object.keys(parsedBody).forEach(k => {
+               properties[k] = { type: typeof parsedBody[k] };
+             });
+
+             requestBody = {
+               content: {
+                 'application/json': {
+                   schema: {
+                     properties,
+                     required: [] // Postman doesn't specify required fields in body usually
+                   }
+                 }
+               }
+             };
+           } catch (e) {
+             // If body isn't valid JSON, we ignore auto-generating body fields
+           }
+        }
+
+        endpoints.push({
+          id: item.id || (item.name + method + Math.random()),
+          path: pathStr,
+          method: method,
+          summary: item.name,
+          parameters: [...pathParams, ...queryParams],
+          requestBody: requestBody,
+          definitions: {} 
+        });
+      }
+    });
+  };
+
+  if (json.item) {
+    traverseItems(json.item);
+  }
+
+  return {
+    info: { title: json.info?.name || 'Postman Collection', version: '1.0' },
+    endpoints
+  };
+};
+
+
 /**
  * COMPONENTS
  */
@@ -118,7 +239,7 @@ const Badge = ({ method }) => {
   );
 };
 
-// NEW: Searchable Select Component
+// Searchable Select Component
 const SearchableSelect = ({ options, value, onChange, placeholder = "Select option..." }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -237,30 +358,39 @@ export default function App() {
   const handleSpecParse = () => {
     try {
       const json = JSON.parse(specInput);
-      
-      // Basic validation
-      if (!json.paths) throw new Error("Invalid OpenAPI/Swagger Spec: Missing 'paths'");
-      
-      // Process endpoints into a flat list
-      const endpoints = [];
-      Object.keys(json.paths).forEach(path => {
-        Object.keys(json.paths[path]).forEach(method => {
-          if (['get', 'post', 'put', 'delete', 'patch'].includes(method.toLowerCase())) {
-            const details = json.paths[path][method];
-            endpoints.push({
-              id: `${method}-${path}`,
-              path,
-              method,
-              summary: details.summary || details.operationId || path,
-              parameters: details.parameters || [],
-              requestBody: details.requestBody,
-              definitions: json.definitions || json.components?.schemas // Handle V2 and V3
-            });
-          }
-        });
-      });
+      let parsedData = null;
 
-      setParsedSpec({ info: json.info, endpoints });
+      // DETECT TYPE
+      if (json.openapi || json.swagger) {
+        // --- SWAGGER / OPENAPI ---
+        if (!json.paths) throw new Error("Invalid OpenAPI/Swagger Spec: Missing 'paths'");
+        const endpoints = [];
+        Object.keys(json.paths).forEach(path => {
+          Object.keys(json.paths[path]).forEach(method => {
+            if (['get', 'post', 'put', 'delete', 'patch'].includes(method.toLowerCase())) {
+              const details = json.paths[path][method];
+              endpoints.push({
+                id: `${method}-${path}`,
+                path,
+                method,
+                summary: details.summary || details.operationId || path,
+                parameters: details.parameters || [],
+                requestBody: details.requestBody,
+                definitions: json.definitions || json.components?.schemas
+              });
+            }
+          });
+        });
+        parsedData = { info: json.info, endpoints };
+
+      } else if (json.info && json.item) {
+        // --- POSTMAN COLLECTION ---
+        parsedData = parsePostmanCollection(json);
+      } else {
+        throw new Error("Unknown Format. Please paste a valid OpenAPI JSON or Postman Collection.");
+      }
+
+      setParsedSpec(parsedData);
       setError('');
       setActiveTab('manual');
     } catch (e) {
@@ -593,11 +723,11 @@ export default function App() {
                 Step 1: Import API Spec
               </h2>
               <p className="text-slate-500 text-sm mb-4">
-                Paste your Swagger/OpenAPI JSON content here. This defines the form fields for testing.
+                Paste your <strong>OpenAPI/Swagger JSON</strong> OR <strong>Postman Collection JSON</strong> here.
               </p>
               <textarea
                 className="w-full h-48 font-mono text-xs bg-slate-50 border border-slate-300 rounded-md p-3 focus:ring-2 focus:ring-blue-500 outline-none"
-                placeholder='{"openapi": "3.0.0", "info": {...}, "paths": {...}}'
+                placeholder='Paste JSON content here...'
                 value={specInput}
                 onChange={(e) => setSpecInput(e.target.value)}
               />
